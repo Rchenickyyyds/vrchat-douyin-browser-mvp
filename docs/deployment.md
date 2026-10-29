@@ -20,7 +20,7 @@ cd server
 cp .env.example .env
 docker compose config
 docker compose up -d --build
-curl --fail http://127.0.0.1:8080/health
+curl --fail http://localhost:8080/health
 docker compose logs --tail=100 app caddy
 ```
 
@@ -58,7 +58,7 @@ HOST=127.0.0.1 H264_ENCODER=libx264 npm start
 下面示例在 Docker 的本机地址操作 Guest。它会打开 `config/default.json` 指定的网站并产生视频数据，需完整运行时和网络。首次测试不要登录真实账号。
 
 ```bash
-base=http://127.0.0.1:8080
+base=http://localhost:8080
 slot=$(curl --fail --silent --show-error "$base/api/session/create/guest")
 curl --fail "$base/stream/$slot/index.m3u8"
 curl --fail "$base/api/session/$slot/heartbeat"

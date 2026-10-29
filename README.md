@@ -51,7 +51,7 @@ cd server
 cp .env.example .env
 docker compose config
 docker compose up -d --build
-curl --fail http://127.0.0.1:8080/health
+curl --fail http://localhost:8080/health
 ```
 
 示例默认 `DOMAIN=http://localhost:8080`、`BIND_ADDRESS=127.0.0.1`。`/health` 返回 `ok` 只表示 HTTP 服务可达，不会启动 Chromium，也不能证明视频链路正常。Docker 完整构建/抓流本轮尚未验证。

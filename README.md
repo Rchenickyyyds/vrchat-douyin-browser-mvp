@@ -136,4 +136,4 @@ npm test
 
 ## 许可
 
-原创集成代码的开源许可证**待作者确认**，当前快照未附项目级 `LICENSE`，不能据此假定已获得 MIT 等开源授权。第三方组件继续适用各自条款，见 [第三方说明](THIRD_PARTY_NOTICES.md)。
+原创集成代码采用 [MIT License](LICENSE)。第三方组件继续适用各自条款，见 [第三方说明](THIRD_PARTY_NOTICES.md)。

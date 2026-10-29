@@ -1,289 +1,143 @@
 using UdonSharp;
 using UnityEngine;
 using VRC.SDK3.Components.Video;
-using VRC.SDK3.StringLoading;
 using VRC.SDK3.Video.Components.AVPro;
 using VRC.SDKBase;
 
-[UdonBehaviourSyncMode(BehaviourSyncMode.Manual)]
+[UdonBehaviourSyncMode(BehaviourSyncMode.None)]
 public class DouyinBrowserManager : UdonSharpBehaviour
 {
-    // 第一版身份配置：只改这里。
-    public const string VRC_USER_1 = "Example User One";
-    public const string VRC_USER_2 = "Example User Two";
-
-    private const float STRING_REQUEST_COOLDOWN = 5.2f;
-    private const float HEARTBEAT_INTERVAL = 30f;
+    private const float VIDEO_REQUEST_COOLDOWN = 5.2f;
     private const float VIDEO_RETRY_DELAY = 6f;
+    private const int MAX_AUTOMATIC_RETRIES = 3;
 
-    [Header("场景引用")]
+    [Header("本地播放器引用（不创建或控制服务器 Session）")]
     public BrowserSlotUrls slotUrls;
     public VRCAVProVideoPlayer videoPlayer;
     public DouyinBrowserUI ui;
 
-    [UdonSynced] public bool browserInitialized;
-    [UdonSynced] public int slotId = -1;
-    [UdonSynced] public int profileType = -1;
-    [UdonSynced] public int controllerPlayerId = -1;
-    [UdonSynced] public string controllerDisplayName = "";
-    [UdonSynced] public string currentStatus = "未初始化";
+    [HideInInspector] public bool localPlaybackRequested;
+    [HideInInspector] public bool localPlaying;
+    [HideInInspector] public string currentStatus = "请粘贴授权控制端提供的短期观看 URL";
 
-    [HideInInspector] public bool localRequestInFlight;
-
-    private int pendingProfileType = -1;
-    private string pendingLabel = "";
-    private float nextStringRequestTime;
-    private float nextHeartbeatTime;
+    private VRCUrl currentStreamUrl = VRCUrl.Empty;
     private float nextVideoLoadTime;
-    private int playingSlot = -1;
-    private int videoRetryCount;
-    private bool videoRetryScheduled;
+    private float retryAt;
+    private int automaticRetries;
+    private bool retryPending;
 
     private void Start()
     {
         RefreshUi();
-        ApplySyncedState();
     }
 
     private void Update()
     {
-        if (!browserInitialized || !Networking.IsOwner(gameObject) || localRequestInFlight) return;
-        if (Time.realtimeSinceStartup < nextHeartbeatTime) return;
-        SendStringRequest(slotUrls.heartbeatUrls[slotId], "心跳");
+        if (!localPlaybackRequested || !retryPending || Time.realtimeSinceStartup < retryAt) return;
+        retryPending = false;
+        LoadCurrentStream();
     }
 
-    public void InitializeBrowser()
+    public void PlayEnteredStream()
     {
-        if (browserInitialized || localRequestInFlight || Networking.LocalPlayer == null) return;
-        pendingProfileType = ProfileForDisplayName(Networking.LocalPlayer.displayName);
-        Networking.SetOwner(Networking.LocalPlayer, gameObject);
-        SendCustomEventDelayedFrames(nameof(BeginInitializationAsOwner), 2);
-    }
-
-    public void BeginInitializationAsOwner()
-    {
-        if (browserInitialized || localRequestInFlight || !Networking.IsOwner(gameObject)) return;
-        controllerPlayerId = Networking.LocalPlayer.playerId;
-        controllerDisplayName = Networking.LocalPlayer.displayName;
-        currentStatus = "正在初始化服务器端 Chromium";
-        profileType = pendingProfileType;
-        RequestSerialization();
-        RefreshUi();
-        SendStringRequest(slotUrls.GetCreateUrl(pendingProfileType), "初始化");
-    }
-
-    public void GetControl()
-    {
-        if (!browserInitialized || controllerPlayerId != -1 || Networking.LocalPlayer == null) return;
-        Networking.SetOwner(Networking.LocalPlayer, gameObject);
-        SendCustomEventDelayedFrames(nameof(AcquireControlAsOwner), 2);
-    }
-
-    public void AcquireControlAsOwner()
-    {
-        if (!browserInitialized || controllerPlayerId != -1 || !Networking.IsOwner(gameObject)) return;
-        controllerPlayerId = Networking.LocalPlayer.playerId;
-        controllerDisplayName = Networking.LocalPlayer.displayName;
-        currentStatus = "运行中";
-        RequestSerialization();
-        RefreshUi();
-    }
-
-    public void Previous()
-    {
-        SendControlAction(0, "上一条");
-    }
-
-    public void Next()
-    {
-        SendControlAction(1, "下一条");
-    }
-
-    public void Like()
-    {
-        SendControlAction(2, "点赞");
-    }
-
-    public void Favorite()
-    {
-        SendControlAction(3, "收藏");
-    }
-
-    private void SendControlAction(int action, string label)
-    {
-        if (!IsLocalController())
+        if (localPlaybackRequested) return;
+        if (slotUrls == null || videoPlayer == null)
         {
-            currentStatus = "只有当前控制者可以操作";
-            RefreshUi();
+            SetStatus("播放器或 URL 输入组件尚未接线");
             return;
         }
-        SendStringRequest(slotUrls.GetActionUrl(slotId, action), label);
-    }
-
-    private void SendStringRequest(VRCUrl url, string label)
-    {
-        if (localRequestInFlight) return;
-        if (Time.realtimeSinceStartup < nextStringRequestTime)
+        if (Time.realtimeSinceStartup < nextVideoLoadTime)
         {
-            currentStatus = "VRChat URL 限速，请稍后再试";
-            RefreshUi();
-            return;
-        }
-        if (VRCUrl.IsNullOrEmpty(url))
-        {
-            currentStatus = "Slot URL 未配置";
-            RefreshUi();
+            SetStatus("视频 URL 加载冷却中，请稍后再试");
             return;
         }
 
-        localRequestInFlight = true;
-        pendingLabel = label;
-        nextStringRequestTime = Time.realtimeSinceStartup + STRING_REQUEST_COOLDOWN;
-        nextHeartbeatTime = Time.realtimeSinceStartup + HEARTBEAT_INTERVAL;
-        VRCStringDownloader.LoadUrl(url, this);
-        RefreshUi();
-    }
-
-    public override void OnStringLoadSuccess(IVRCStringDownload result)
-    {
-        localRequestInFlight = false;
-        int createdProfile = slotUrls.GetCreateProfileType(result.Url);
-        if (createdProfile >= 0)
+        VRCUrl requestedUrl = slotUrls.GetStreamUrl();
+        if (VRCUrl.IsNullOrEmpty(requestedUrl) || !requestedUrl.Get().StartsWith("https://"))
         {
-            int createdSlot;
-            if (!int.TryParse(result.Result.Trim(), out createdSlot) || createdSlot < 0 || createdSlot >= BrowserSlotUrls.SLOT_COUNT)
-            {
-                FailInitialization("初始化返回了无效 Slot");
-                return;
-            }
-
-            browserInitialized = true;
-            slotId = createdSlot;
-            profileType = createdProfile;
-            controllerPlayerId = Networking.LocalPlayer.playerId;
-            controllerDisplayName = Networking.LocalPlayer.displayName;
-            currentStatus = "浏览器已启动，等待视频流";
-            RequestSerialization();
-            ApplySyncedState();
+            SetStatus("请粘贴完整的 HTTPS 观看 URL");
             return;
         }
 
-        if (pendingLabel != "心跳") SetOwnerStatus(pendingLabel + "：成功");
-        else RefreshUi();
+        currentStreamUrl = requestedUrl;
+        automaticRetries = 0;
+        retryPending = false;
+        localPlaybackRequested = true;
+        LoadCurrentStream();
     }
 
-    public override void OnStringLoadError(IVRCStringDownload result)
+    public void StopPlayback()
     {
-        localRequestInFlight = false;
-        string message = pendingLabel + "失败（HTTP " + result.ErrorCode + "）：" + result.Error;
-        if (pendingLabel == "初始化" && !browserInitialized) FailInitialization(message);
-        else SetOwnerStatus(message);
+        localPlaybackRequested = false;
+        localPlaying = false;
+        retryPending = false;
+        currentStreamUrl = VRCUrl.Empty;
+        if (videoPlayer != null) videoPlayer.Stop();
+        if (slotUrls != null) slotUrls.ClearInput();
+        SetStatus("已停止本地播放并清空输入；服务器 Session 由授权控制端管理");
     }
 
-    public override void OnDeserialization()
+    private void LoadCurrentStream()
     {
-        ApplySyncedState();
-    }
-
-    public override void OnPlayerLeft(VRCPlayerApi player)
-    {
-        if (player.playerId != controllerPlayerId || !Networking.IsOwner(gameObject)) return;
-        controllerPlayerId = -1;
-        controllerDisplayName = "";
-        currentStatus = "控制者已离开，可获取控制权";
-        RequestSerialization();
-        RefreshUi();
-    }
-
-    public override bool OnOwnershipRequest(VRCPlayerApi requester, VRCPlayerApi newOwner)
-    {
-        return controllerPlayerId == -1 || (Utilities.IsValid(newOwner) && newOwner.playerId == controllerPlayerId);
-    }
-
-    public override void OnOwnershipTransferred(VRCPlayerApi player)
-    {
-        if (Networking.IsOwner(gameObject)) nextHeartbeatTime = Time.realtimeSinceStartup;
-        RefreshUi();
+        if (!localPlaybackRequested || VRCUrl.IsNullOrEmpty(currentStreamUrl)) return;
+        nextVideoLoadTime = Time.realtimeSinceStartup + VIDEO_REQUEST_COOLDOWN;
+        localPlaying = false;
+        SetStatus("正在加载本地视频流");
+        videoPlayer.PlayURL(currentStreamUrl);
     }
 
     public override void OnVideoReady()
     {
-        videoPlayer.Play();
+        if (localPlaybackRequested) videoPlayer.Play();
     }
 
     public override void OnVideoStart()
     {
-        videoRetryCount = 0;
-        videoRetryScheduled = false;
-        RefreshUi();
+        if (!localPlaybackRequested) return;
+        localPlaying = true;
+        retryPending = false;
+        SetStatus("正在本地播放；此 URL 持有者可以观看并转发链接");
+    }
+
+    public override void OnVideoEnd()
+    {
+        if (!localPlaybackRequested) return;
+        localPlaybackRequested = false;
+        localPlaying = false;
+        retryPending = false;
+        currentStreamUrl = VRCUrl.Empty;
+        SetStatus("视频流已结束；请向授权控制端确认 Session 和观看链接状态");
     }
 
     public override void OnVideoError(VideoError videoError)
     {
-        if (!browserInitialized || videoRetryScheduled || videoRetryCount >= 10) return;
-        videoRetryCount++;
-        videoRetryScheduled = true;
-        SendCustomEventDelayedSeconds(nameof(RetryStream), VIDEO_RETRY_DELAY);
-    }
-
-    public void RetryStream()
-    {
-        videoRetryScheduled = false;
-        PlayCurrentStream();
-    }
-
-    public void PlayCurrentStream()
-    {
-        if (!browserInitialized || slotId < 0 || slotId >= BrowserSlotUrls.SLOT_COUNT) return;
-        if (Time.realtimeSinceStartup < nextVideoLoadTime)
+        if (!localPlaybackRequested || retryPending) return;
+        localPlaying = false;
+        if (automaticRetries >= MAX_AUTOMATIC_RETRIES)
         {
-            if (!videoRetryScheduled)
-            {
-                videoRetryScheduled = true;
-                SendCustomEventDelayedSeconds(nameof(RetryStream), VIDEO_RETRY_DELAY);
-            }
+            localPlaybackRequested = false;
+            currentStreamUrl = VRCUrl.Empty;
+            videoPlayer.Stop();
+            SetStatus("播放失败，已达到自动重试上限；请检查链接有效期和客户端 URL 设置");
             return;
         }
 
-        videoRetryScheduled = false;
-        nextVideoLoadTime = Time.realtimeSinceStartup + STRING_REQUEST_COOLDOWN;
-        playingSlot = slotId;
-        videoPlayer.Stop();
-        videoPlayer.PlayURL(slotUrls.streamUrls[slotId]);
+        automaticRetries++;
+        retryPending = true;
+        retryAt = Time.realtimeSinceStartup + VIDEO_RETRY_DELAY;
+        if (retryAt < nextVideoLoadTime) retryAt = nextVideoLoadTime;
+        SetStatus("视频加载失败，等待自动重试（" + automaticRetries + "/" + MAX_AUTOMATIC_RETRIES + "）");
     }
 
-    public bool IsLocalController()
+    private void OnDisable()
     {
-        return browserInitialized && Networking.LocalPlayer != null &&
-               Networking.LocalPlayer.playerId == controllerPlayerId;
+        StopPlayback();
     }
 
-    private int ProfileForDisplayName(string displayName)
-    {
-        if (displayName == VRC_USER_1) return BrowserSlotUrls.PROFILE_USER_1;
-        if (displayName == VRC_USER_2) return BrowserSlotUrls.PROFILE_USER_2;
-        return BrowserSlotUrls.PROFILE_GUEST;
-    }
-
-    private void ApplySyncedState()
-    {
-        RefreshUi();
-        if (browserInitialized && playingSlot != slotId) PlayCurrentStream();
-    }
-
-    private void SetOwnerStatus(string value)
+    private void SetStatus(string value)
     {
         currentStatus = value;
-        if (Networking.IsOwner(gameObject)) RequestSerialization();
         RefreshUi();
-    }
-
-    private void FailInitialization(string value)
-    {
-        profileType = -1;
-        controllerPlayerId = -1;
-        controllerDisplayName = "";
-        SetOwnerStatus(value);
     }
 
     private void RefreshUi()

@@ -1,11 +1,19 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
+import { HttpError } from "./errors.js";
 
 const PROFILE_NAMES = {
   user1: "profile_user_1",
   user2: "profile_user_2"
 };
+
+async function privateDirectory(directory) {
+  await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+  const stat = await fs.lstat(directory);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("unsafe profile directory");
+  await fs.chmod(directory, 0o700);
+}
 
 export class ProfileManager {
   constructor(dataRoot) {
@@ -15,38 +23,43 @@ export class ProfileManager {
   }
 
   async initialize() {
-    await fs.mkdir(this.profilesRoot, { recursive: true });
+    await privateDirectory(this.profilesRoot);
     await fs.rm(this.guestsRoot, { recursive: true, force: true });
-    await fs.mkdir(this.guestsRoot, { recursive: true });
+    await privateDirectory(this.guestsRoot);
   }
 
-  async acquire(profileType, slot) {
+  async acquire(profileType, slot, ownerId) {
+    if (typeof ownerId !== "string" || !ownerId || ownerId.length > 128) throw new Error("invalid profile owner");
     if (profileType === "guest") {
       const profilePath = path.join(this.guestsRoot, `slot-${slot}-${crypto.randomUUID()}`);
-      await fs.mkdir(profilePath, { recursive: true });
+      await privateDirectory(profilePath);
       return { profileType, profilePath, persistent: false };
     }
 
     const profileName = PROFILE_NAMES[profileType];
     if (!profileName) throw new Error("profile must be user1, user2, or guest");
-    if (this.lockedPermanentProfiles.has(profileName)) {
-      throw new Error(`${profileName} is already active in another instance`);
+    const owner = crypto.createHash("sha256").update(ownerId).digest("hex");
+    const lockKey = `${owner}/${profileName}`;
+    if (this.lockedPermanentProfiles.has(lockKey)) {
+      throw new HttpError(409, `${profileName} is already active in another instance`);
     }
 
-    this.lockedPermanentProfiles.add(profileName);
-    const profilePath = path.join(this.profilesRoot, profileName);
+    this.lockedPermanentProfiles.add(lockKey);
+    const ownerPath = path.join(this.profilesRoot, owner);
+    const profilePath = path.join(ownerPath, profileName);
     try {
-      await fs.mkdir(profilePath, { recursive: true });
-      return { profileType, profilePath, persistent: true, profileName };
+      await privateDirectory(ownerPath);
+      await privateDirectory(profilePath);
+      return { profileType, profilePath, persistent: true, profileName, lockKey };
     } catch (error) {
-      this.lockedPermanentProfiles.delete(profileName);
+      this.lockedPermanentProfiles.delete(lockKey);
       throw error;
     }
   }
 
   async release(profile) {
     if (profile.persistent) {
-      this.lockedPermanentProfiles.delete(profile.profileName);
+      this.lockedPermanentProfiles.delete(profile.lockKey);
       return;
     }
 

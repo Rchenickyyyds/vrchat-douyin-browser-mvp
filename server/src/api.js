@@ -1,97 +1,116 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { bearer, principalFor, RateLimiter } from "./access.js";
+import { HttpError } from "./errors.js";
 
-const MIME_TYPES = {
-  ".m3u8": "application/vnd.apple.mpegurl",
-  ".ts": "video/mp2t"
+const webRoot = fileURLToPath(new URL("../web/", import.meta.url));
+const staticFiles = { "/": ["index.html", "text/html"], "/control.js": ["control.js", "text/javascript"], "/style.css": ["style.css", "text/css"] };
+const headers = {
+  "Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff",
+  "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
 };
-
-function send(response, status, body, contentType = "text/plain; charset=utf-8") {
-  response.writeHead(status, {
-    "Content-Type": contentType,
-    "Cache-Control": "no-store",
-    "Access-Control-Allow-Origin": "*"
-  });
-  response.end(body);
+function send(response, status, body, type = "text/plain; charset=utf-8") {
+  response.writeHead(status, { ...headers, "Content-Type": type }); response.end(body);
 }
+function json(response, status, body) { send(response, status, JSON.stringify(body), "application/json"); }
 
 async function readJson(request) {
-  let body = "";
+  if (!/^application\/json(?:\s*;.*)?$/i.test(request.headers["content-type"] || "")) throw new HttpError(415, "application/json required");
+  const chunks = []; let size = 0;
   for await (const chunk of request) {
-    body += chunk;
-    if (body.length > 1024 * 1024) throw new Error("request body too large");
+    size += chunk.length;
+    if (size > 8192) throw new HttpError(413, "request body too large");
+    chunks.push(chunk);
   }
-  return body ? JSON.parse(body) : {};
+  try { return JSON.parse(Buffer.concat(chunks).toString("utf8")); }
+  catch { throw new HttpError(400, "invalid JSON"); }
+}
+
+function metadata(session) {
+  return { id: session.id, slot: session.slot, profile: session.profile.profileType, expiresAt: session.expiresAt, viewExpiresAt: session.viewExpiresAt };
+}
+function shareResult(config, session, viewToken) {
+  return { ...metadata(session), viewUrl: `${config.publicOrigin || ""}/stream/${session.id}/${viewToken}/index.m3u8` };
 }
 
 export function createApi(config, sessions) {
-  return http.createServer(async (request, response) => {
+  const requests = new RateLimiter(180, 60000);
+  const control = new RateLimiter(60, 60000);
+  const creates = new RateLimiter(3, 60000);
+  const server = http.createServer({ maxHeaderSize: 16384, requestTimeout: 10000, headersTimeout: 10000, keepAliveTimeout: 5000 }, async (request, response) => {
     try {
-      if (request.method === "OPTIONS") {
-        response.writeHead(204, {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type"
-        });
-        return response.end();
-      }
-
       const url = new URL(request.url, "http://localhost");
-      if (request.method === "GET" && url.pathname === "/health") return send(response, 200, "ok");
-
-      const hlsMatch = url.pathname.match(/^\/stream\/(\d+)\/(index\.m3u8|segment_\d+\.ts)$/);
-      if (request.method === "GET" && hlsMatch) {
-        const slot = Number(hlsMatch[1]);
-        if (!Number.isInteger(slot) || slot < 0 || slot >= config.slotCount) return send(response, 404, "not found");
-        const filename = path.join(config.dataRoot, "hls", String(slot), hlsMatch[2]);
+      if (request.headers.origin && request.headers.origin !== config.publicOrigin) throw new HttpError(403, "origin is not permitted");
+      if (request.method === "GET" && url.pathname === "/health") return send(response, sessions.unhealthy || sessions.shuttingDown ? 503 : 200, sessions.unhealthy || sessions.shuttingDown ? "unavailable" : "ok");
+      if (request.method === "GET" && staticFiles[url.pathname]) {
+        const [name, type] = staticFiles[url.pathname];
+        return send(response, 200, await fs.promises.readFile(path.join(webRoot, name)), type);
+      }
+      const hls = url.pathname.match(/^\/stream\/([a-f0-9-]{36})\/([A-Za-z0-9_-]{43})\/(index\.m3u8|segment_\d+\.ts)$/);
+      if (hls && request.method === "GET") {
+        const session = sessions.viewer(hls[1], hls[2]);
+        const filename = path.join(session.resources.hlsDirectory, hls[3]);
+        let handle;
         try {
-          const stat = await fs.promises.stat(filename);
-          response.writeHead(200, {
-            "Content-Type": MIME_TYPES[path.extname(filename)],
-            "Content-Length": stat.size,
-            "Cache-Control": filename.endsWith(".m3u8") ? "no-store" : "public, max-age=10",
-            "Access-Control-Allow-Origin": "*"
-          });
-          const stream = fs.createReadStream(filename);
+          handle = await fs.promises.open(filename, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+          const stat = await handle.stat();
+          if (!stat.isFile()) throw new Error("not a file");
+          // Recheck revocation after asynchronous file open, before sending any bytes.
+          sessions.viewer(hls[1], hls[2]);
+          response.writeHead(200, { ...headers, "Content-Type": hls[3].endsWith(".m3u8") ? "application/vnd.apple.mpegurl" : "video/mp2t", "Content-Length": stat.size });
+          const stream = handle.createReadStream();
           stream.on("error", () => response.destroy());
-          return stream.pipe(response);
-        } catch {
-          return send(response, 404, "stream not ready");
+          response.on("close", () => stream.destroy());
+          stream.pipe(response);
+          return;
+        } catch (error) {
+          await handle?.close().catch(() => {});
+          if (error instanceof HttpError) throw error;
+          throw new HttpError(404, "stream is not ready");
         }
       }
-
-      let createProfile;
-      const fixedCreate = url.pathname.match(/^\/api\/session\/create\/(user1|user2|guest)$/);
-      if (request.method === "GET" && fixedCreate) createProfile = fixedCreate[1];
-      if (request.method === "POST" && url.pathname === "/api/session/create") {
-        createProfile = (await readJson(request)).profile;
+      if (!url.pathname.startsWith("/api/")) throw new HttpError(404, "not found");
+      if (url.search) throw new HttpError(400, "API query parameters are not accepted");
+      let token;
+      try { token = bearer(request); }
+      catch (error) { requests.take(request.socket.remoteAddress); throw error; }
+      const principal = principalFor(token, config.users);
+      if (url.pathname === "/api/sessions") {
+        if (!principal) { requests.take(request.socket.remoteAddress); throw new HttpError(401, "invalid operator token"); }
+        control.take(principal.id);
+        if (request.method === "GET") return json(response, 200, [...sessions.byId.values()].filter((s) => {
+          if (s.ownerId !== principal.id) return false;
+          try { sessions.get(s.id); return true; } catch { return false; }
+        }).map(metadata));
+        if (request.method !== "POST") throw new HttpError(405, "method not allowed");
+        creates.take(principal.id);
+        const body = await readJson(request);
+        if (!body || Array.isArray(body) || typeof body !== "object" || Object.keys(body).some((key) => key !== "profile")) throw new HttpError(400, "expected a profile object");
+        const { session, controlToken, viewToken } = await sessions.create(body.profile || "guest", principal);
+        return json(response, 201, { ...shareResult(config, session, viewToken), controlToken });
       }
-      if (createProfile) {
-        const session = await sessions.create(createProfile);
-        return send(response, 201, String(session.slot));
-      }
-
-      const apiMatch = url.pathname.match(/^\/api\/session\/(\d+)\/(next|prev|like|favorite|heartbeat|close)$/);
-      if (apiMatch && (request.method === "GET" || request.method === "POST")) {
-        const slot = Number(apiMatch[1]);
-        const action = apiMatch[2];
-        if (action === "heartbeat") sessions.heartbeat(slot);
-        else if (action === "close") await sessions.close(slot);
-        else await sessions.action(slot, action);
-        return send(response, 200, "ok");
-      }
-
-      return send(response, 404, "not found");
+      const action = url.pathname.match(/^\/api\/sessions\/([a-f0-9-]{36})\/(next|prev|like|favorite|heartbeat|close|share)$/);
+      if (!action) { requests.take(request.socket.remoteAddress); throw new HttpError(404, "not found"); }
+      if (request.method !== "POST") throw new HttpError(405, "method not allowed");
+      try { sessions.authorize(action[1], token, principal, action[2] === "close"); }
+      catch (error) { requests.take(request.socket.remoteAddress); throw error; }
+      control.take(principal?.id || action[1]);
+      if (action[2] === "close") await sessions.close(action[1]);
+      else if (action[2] === "heartbeat") sessions.heartbeat(action[1]);
+      else if (action[2] === "share") {
+        const { session, viewToken } = sessions.share(action[1]);
+        return json(response, 200, shareResult(config, session, viewToken));
+      } else await sessions.action(action[1], action[2]);
+      return json(response, 200, { ok: true });
     } catch (error) {
-      console.error(error);
-      const message = error instanceof Error ? error.message : String(error);
-      const status = message.includes("already active") ? 409
-        : message.includes("occupied") ? 503
-        : message.includes("invalid") || message.includes("profile must") ? 400
-        : message.includes("not active") ? 404
-        : 500;
-      return send(response, status, message);
+      const status = error instanceof HttpError ? error.status : 500;
+      if (status === 500) console.error(`request failed (${error?.name || "Error"})`);
+      if (!response.headersSent) json(response, status, { error: status === 500 ? "operation failed" : error.message });
+      else response.destroy();
     }
   });
+  server.maxConnections = 128;
+  return server;
 }

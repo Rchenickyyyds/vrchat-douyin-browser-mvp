@@ -1,7 +1,9 @@
 #!/bin/sh
 set -eu
 
-mkdir -p "$XDG_RUNTIME_DIR"
-chmod 700 "$XDG_RUNTIME_DIR"
-pulseaudio --daemonize=yes --exit-idle-time=-1 --log-target=stderr
+umask 077
+if [ "$(id -u)" -eq 0 ]; then
+  echo "Run this service as a dedicated non-root user." >&2
+  exit 1
+fi
 exec node src/index.js

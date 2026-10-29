@@ -16,3 +16,5 @@ cookies*.json
 storageState*.json
 backups/
 .git/
+secrets/
+private-access/

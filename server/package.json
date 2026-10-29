@@ -1,0 +1,17 @@
+{
+  "name": "vrchat-douyin-browser-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test",
+    "install-browser": "playwright install --with-deps chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.55.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

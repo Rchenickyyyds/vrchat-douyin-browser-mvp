@@ -25,3 +25,6 @@ Build/
 Builds/
 Logs/
 UserSettings/
+server/secrets/
+server/.env
+server/private-access/

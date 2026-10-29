@@ -1,3 +1,14 @@
+{
+  log {
+    format filter {
+      wrap json
+      fields {
+        request delete
+      }
+    }
+  }
+}
+
 {$DOMAIN} {
   encode zstd gzip
   reverse_proxy app:3000

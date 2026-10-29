@@ -1,0 +1,5 @@
+FROM caddy:2
+RUN setcap -r /usr/bin/caddy \
+    && mkdir -p /data/caddy /config/caddy && chown -R 1000:1000 /data /config
+COPY Caddyfile /etc/caddy/Caddyfile
+USER 1000:1000

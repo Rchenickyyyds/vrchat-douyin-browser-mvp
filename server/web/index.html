@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Remote browser control</title><link rel="stylesheet" href="/style.css"><script defer src="/control.js"></script></head>
+<body><main>
+<h1>Remote browser</h1>
+<p>Control your sessions here. Share a temporary viewing link with VRChat only when the browser is ready to be seen.</p>
+<form id="connect"><label>Operator key <input id="key" type="password" autocomplete="off" required></label><button>Connect</button><button id="disconnect" type="button">Disconnect</button></form>
+<section><h2>Sessions</h2><button id="refresh" disabled>Refresh</button><ul id="sessions"></ul>
+<label>Profile <select id="profile"><option value="guest">Temporary guest</option><option value="user1">My saved profile 1</option><option value="user2">My saved profile 2</option></select></label><button id="create" disabled>Create session</button></section>
+<section><h2>Selected session</h2><p id="selected">None</p><div id="actions">
+<button data-action="prev" disabled>Previous</button><button data-action="next" disabled>Next</button><button data-action="like" disabled>Like</button><button data-action="favorite" disabled>Favorite</button><button data-action="share" disabled>New viewing link</button><button data-action="close" disabled>Close session</button></div>
+<label>Viewing link <input id="view" type="password" readonly autocomplete="off"></label><button id="copy" disabled>Copy viewing link</button><p id="expiry"></p>
+<p>Anyone with this link can watch and forward it until expiry or revocation. A new link revokes the previous one. Closing the session revokes all access.</p></section>
+<p id="status" role="status" aria-live="polite">Disconnected. Keys stay in this page's memory and are cleared when you disconnect.</p>
+</main></body></html>

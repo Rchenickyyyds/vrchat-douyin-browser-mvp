@@ -1,20 +1,75 @@
 services:
   app:
+    image: vrchat-douyin-browser:local
     build: .
+    init: true
     restart: unless-stopped
-    shm_size: 2gb
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./chromium-seccomp.json
+    shm_size: 512mb
+    mem_limit: 2g
+    cpus: 2
+    pids_limit: 512
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"
+      net.ipv6.conf.default.disable_ipv6: "1"
+    stop_grace_period: 60s
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=512m,mode=1777
+      - /home/node:rw,nosuid,nodev,noexec,size=64m,uid=1000,gid=1000,mode=700
     environment:
       HOST: 0.0.0.0
       DOUYIN_DATA_ROOT: /app/data
-      H264_ENCODER: ${H264_ENCODER:-auto}
+      ACCESS_FILE: /app/access/access.json
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-http://localhost:8080}
+      BROWSER_PROXY_SERVER: http://egress:3128
+      SLOT_COUNT: ${SLOT_COUNT:-1}
+      H264_ENCODER: ${H264_ENCODER:-libx264}
     volumes:
       - app_data:/app/data
+      - access:/app/access:ro
+    networks: [worker]
+
+  init-access:
+    profiles: [setup]
+    image: vrchat-douyin-browser:local
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    entrypoint: [node, scripts/create-access.mjs]
+    command: [/app/access/access.json, operator, guest]
+    volumes:
+      - access:/app/access
+
+  egress:
+    build:
+      context: .
+      dockerfile: Dockerfile.egress
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777"]
+    mem_limit: 192m
+    pids_limit: 64
+    networks: [worker, outside]
 
   caddy:
-    image: caddy:2
+    build:
+      context: .
+      dockerfile: Dockerfile.caddy
     restart: unless-stopped
-    depends_on:
-      - app
+    depends_on: [app]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:rw,nosuid,nodev,noexec,size=32m,mode=1777"]
+    mem_limit: 128m
+    pids_limit: 64
     environment:
       DOMAIN: ${DOMAIN:-http://localhost:8080}
     ports:
@@ -23,11 +78,19 @@ services:
       - "${BIND_ADDRESS:-127.0.0.1}:443:443"
       - "${BIND_ADDRESS:-127.0.0.1}:443:443/udp"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+    networks: [worker, outside]
+
+networks:
+  worker:
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+  outside: {}
 
 volumes:
   app_data:
+  access:
   caddy_data:
   caddy_config:

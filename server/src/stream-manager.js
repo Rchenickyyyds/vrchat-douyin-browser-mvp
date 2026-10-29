@@ -1,81 +1,167 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import crypto from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
-async function stopChild(child) {
-  if (!child || !child.pid || child.exitCode !== null) return;
-  child.kill("SIGTERM");
-  await Promise.race([new Promise((resolve) => child.once("exit", resolve)), wait(3000)]);
-  if (child.exitCode === null) child.kill("SIGKILL");
+function exited(child) {
+  return !child || !child.pid || child.exitCode !== null || child.signalCode !== null;
+}
+
+export async function stopChild(child, graceMilliseconds = 3000) {
+  if (exited(child)) return;
+  let onExit;
+  const stopped = new Promise((resolve) => { onExit = resolve; child.once("exit", onExit); });
+  let timer;
+  try {
+    child.kill("SIGTERM");
+    await Promise.race([stopped, new Promise((resolve) => { timer = setTimeout(resolve, graceMilliseconds); })]);
+    clearTimeout(timer);
+    if (!exited(child)) {
+      child.kill("SIGKILL");
+      await Promise.race([stopped, new Promise((resolve) => { timer = setTimeout(resolve, graceMilliseconds); })]);
+    }
+    if (!exited(child)) throw new Error("child process did not exit after SIGKILL");
+  } finally {
+    clearTimeout(timer);
+    child.removeListener("exit", onExit);
+  }
+}
+
+function xauthority(cookie) {
+  // Xauthority's wildcard address and empty display number match only this private cookie.
+  const fields = [Buffer.alloc(0), Buffer.alloc(0), Buffer.from("MIT-MAGIC-COOKIE-1"), cookie];
+  const family = Buffer.from([0xff, 0xff]);
+  return Buffer.concat([family, ...fields.flatMap((field) => {
+    const length = Buffer.alloc(2);
+    length.writeUInt16BE(field.length);
+    return [length, field];
+  })]);
+}
+
+function privateEnvironment(resources) {
+  return {
+    PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
+    LANG: "C.UTF-8",
+    HOME: resources.browserHome,
+    TMPDIR: resources.runtimeDirectory,
+    XDG_RUNTIME_DIR: resources.runtimeDirectory,
+    DISPLAY: resources.display,
+    XAUTHORITY: resources.xauthority,
+    PULSE_SERVER: resources.pulseServer,
+    PULSE_COOKIE: resources.pulseCookie,
+    PULSE_SINK: resources.pulseSink
+  };
 }
 
 export class StreamManager {
-  constructor(config) {
+  constructor(config, runtime = {}) {
     this.config = config;
     this.hlsRoot = path.join(config.dataRoot, "hls");
     this.ffmpegEncoders = null;
+    this.spawn = runtime.spawn || spawn;
+    this.execFile = runtime.execFile || execFileAsync;
+    this.wait = runtime.wait || wait;
   }
 
   async initialize() {
-    await fs.mkdir(this.hlsRoot, { recursive: true });
+    await fs.mkdir(this.hlsRoot, { recursive: true, mode: 0o700 });
+    const stat = await fs.lstat(this.hlsRoot);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("unsafe HLS directory");
+    await fs.chmod(this.hlsRoot, 0o700);
   }
 
-  async prepare(slot) {
-    const displayNumber = 100 + slot;
-    const display = `:${displayNumber}`;
-    const pulseSink = `douyin_slot_${slot}`;
-    const hlsDirectory = path.join(this.hlsRoot, String(slot));
-    await fs.rm(hlsDirectory, { recursive: true, force: true });
-    await fs.mkdir(hlsDirectory, { recursive: true });
+  managedChild(command, args, options = {}) {
+    const child = this.spawn(command, args, { stdio: ["ignore", "ignore", "pipe"], ...options });
+    child.errorTail = "";
+    child.on("error", (error) => { child.spawnError = error; });
+    child.stderr?.on("data", (chunk) => { child.errorTail = (child.errorTail + chunk).slice(-4000); });
+    return child;
+  }
 
-    const xvfb = spawn("Xvfb", [
-      display,
-      "-screen", "0", `${this.config.display.width}x${this.config.display.height}x24`,
-      "-nolisten", "tcp",
-      "-ac"
-    ], { stdio: ["ignore", "ignore", "pipe"] });
-    let xvfbError = "";
-    let xvfbSpawnError = "";
-    xvfb.on("error", (error) => { xvfbSpawnError = error.message; });
-    xvfb.stderr.on("data", (chunk) => { xvfbError = (xvfbError + chunk).slice(-4000); });
-
-    const socket = `/tmp/.X11-unix/X${displayNumber}`;
+  async prepare(slot, id) {
+    if (typeof id !== "string" || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(id)) {
+      throw new Error("invalid session resource id");
+    }
+    const resources = { slot, id, ffmpeg: null, xvfb: null, pulse: null, encoder: null };
     try {
-      for (let attempt = 0; attempt < 50; attempt++) {
-        if (xvfbSpawnError || xvfb.exitCode !== null) {
-          throw new Error(`Xvfb failed: ${(xvfbSpawnError || xvfbError).trim()}`);
-        }
-        try {
-          await fs.access(socket);
-          break;
-        } catch {
-          if (attempt === 49) throw new Error("Xvfb did not become ready");
-          await wait(100);
-        }
-      }
+      const hlsDirectory = path.join(this.hlsRoot, id);
+      await fs.mkdir(hlsDirectory, { mode: 0o700 });
+      resources.hlsDirectory = hlsDirectory;
+      resources.runtimeDirectory = await fs.mkdtemp("/tmp/vrchat-browser-");
+      await fs.chmod(resources.runtimeDirectory, 0o700);
+      resources.browserHome = path.join(resources.runtimeDirectory, "home");
+      await fs.mkdir(resources.browserHome, { mode: 0o700 });
+      resources.xauthority = path.join(resources.runtimeDirectory, "xauthority");
+      await fs.writeFile(resources.xauthority, xauthority(crypto.randomBytes(16)), { mode: 0o600, flag: "wx" });
+      resources.pulseCookie = path.join(resources.runtimeDirectory, "pulse-cookie");
+      await fs.writeFile(resources.pulseCookie, crypto.randomBytes(256), { mode: 0o600, flag: "wx" });
+      const pulseSocket = path.join(resources.runtimeDirectory, "pulse.sock");
+      resources.pulseServer = `unix:${pulseSocket}`;
+      resources.pulseSink = `douyin_${id.replaceAll("-", "")}`;
+
+      resources.xvfb = this.managedChild("Xvfb", [
+        "-displayfd", "3", "-screen", "0", `${this.config.display.width}x${this.config.display.height}x24`,
+        "-nolisten", "tcp", "-auth", resources.xauthority
+      ], { env: privateEnvironment(resources), stdio: ["ignore", "ignore", "pipe", "pipe"] });
+      resources.display = await this.displayReady(resources.xvfb);
+      resources.env = privateEnvironment(resources);
+      resources.pulse = this.managedChild("pulseaudio", [
+        "--daemonize=no", "--use-pid-file=no", "--exit-idle-time=-1", "--disallow-exit=yes",
+        "--disallow-module-loading=yes", "--log-target=stderr", "-n",
+        `--load=module-native-protocol-unix socket=${pulseSocket} auth-cookie=${resources.pulseCookie} auth-cookie-enabled=1 auth-anonymous=0 auth-group-enable=0`,
+        `--load=module-null-sink sink_name=${resources.pulseSink}`
+      ], { env: resources.env });
+      await this.pulseReady(resources);
+      return resources;
     } catch (error) {
-      await stopChild(xvfb);
+      try { await this.stop(resources); } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], "session resource startup and cleanup failed");
+      }
       throw error;
     }
+  }
 
-    let pulseModule;
-    try {
-      const { stdout } = await execFileAsync("pactl", [
-        "load-module", "module-null-sink",
-        `sink_name=${pulseSink}`,
-        `sink_properties=device.description=${pulseSink}`
-      ]);
-      pulseModule = stdout.trim();
-    } catch (error) {
-      await stopChild(xvfb);
-      throw new Error(`cannot create PulseAudio sink: ${error.message}`);
+  displayReady(child) {
+    return new Promise((resolve, reject) => {
+      let output = "";
+      const finish = (error, display) => {
+        clearTimeout(timer);
+        child.removeListener("error", failed);
+        child.removeListener("exit", failed);
+        child.stdio[3].removeListener("data", data);
+        if (error) reject(error); else resolve(display);
+      };
+      const failed = () => finish(new Error("private Xvfb failed to start"));
+      const data = (chunk) => {
+        output += chunk;
+        if (output.includes("\n")) {
+          const number = output.trim();
+          if (!/^\d{1,5}$/.test(number)) finish(new Error("invalid Xvfb display number"));
+          else finish(null, `:${number}`);
+        }
+      };
+      const timer = setTimeout(() => finish(new Error("private Xvfb did not become ready")), 10000);
+      child.on("error", failed);
+      child.on("exit", failed);
+      child.stdio[3].on("data", data);
+    });
+  }
+
+  async pulseReady(resources) {
+    for (let attempt = 0; attempt < 50; attempt++) {
+      if (resources.pulse.spawnError || exited(resources.pulse)) throw new Error("private PulseAudio failed to start");
+      try {
+        await this.execFile("pactl", ["info"], { env: resources.env, timeout: 1000 });
+        return;
+      } catch {
+        await this.wait(100);
+      }
     }
-
-    return { slot, display, pulseSink, pulseModule, hlsDirectory, xvfb, ffmpeg: null, encoder: null };
+    throw new Error("private PulseAudio did not become ready");
   }
 
   async start(resources) {
@@ -85,7 +171,7 @@ export class StreamManager {
       const encoder = candidates[index];
       if (index > 0) {
         await fs.rm(resources.hlsDirectory, { recursive: true, force: true });
-        await fs.mkdir(resources.hlsDirectory, { recursive: true });
+        await fs.mkdir(resources.hlsDirectory, { mode: 0o700 });
       }
       try {
         resources.ffmpeg = await this.startFfmpeg(resources, encoder);
@@ -103,7 +189,7 @@ export class StreamManager {
     const requested = this.config.stream.encoder;
     if (requested !== "auto") return requested === "libx264" ? [requested] : [requested, "libx264"];
     if (!this.ffmpegEncoders) {
-      const { stdout } = await execFileAsync("ffmpeg", ["-hide_banner", "-encoders"], { maxBuffer: 4 * 1024 * 1024 });
+      const { stdout } = await this.execFile("ffmpeg", ["-hide_banner", "-encoders"], { maxBuffer: 4 * 1024 * 1024 });
       this.ffmpegEncoders = stdout;
     }
     return ["h264_nvenc", "h264_qsv", "h264_amf"].filter((name) => this.ffmpegEncoders.includes(name)).concat("libx264");
@@ -147,7 +233,7 @@ export class StreamManager {
       "-hls_segment_filename", segmentPattern,
       playlist
     ];
-    const child = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
+    const child = this.managedChild("ffmpeg", args, { env: resources.env });
     let errorTail = "";
     child.on("error", (error) => { errorTail = error.message; });
     child.stderr.on("data", (chunk) => { errorTail = (errorTail + chunk).slice(-8000); });
@@ -164,11 +250,18 @@ export class StreamManager {
 
   async stop(resources) {
     if (!resources) return;
-    await stopChild(resources.ffmpeg);
-    await stopChild(resources.xvfb);
-    if (resources.pulseModule) {
-      await execFileAsync("pactl", ["unload-module", resources.pulseModule]).catch(() => {});
-    }
-    await fs.rm(resources.hlsDirectory, { recursive: true, force: true });
+    if (resources.stopPromise) return resources.stopPromise;
+    resources.stopPromise = (async () => {
+      const results = await Promise.allSettled([
+        stopChild(resources.ffmpeg), stopChild(resources.pulse), stopChild(resources.xvfb)
+      ]);
+      const errors = results.filter((result) => result.status === "rejected").map((result) => result.reason);
+      if (errors.length) throw new AggregateError(errors, "session child cleanup failed");
+      const directories = await Promise.allSettled([resources.hlsDirectory, resources.runtimeDirectory]
+        .filter(Boolean).map((directory) => fs.rm(directory, { recursive: true, force: true })));
+      const failures = directories.filter((result) => result.status === "rejected").map((result) => result.reason);
+      if (failures.length) throw new AggregateError(failures, "session directory cleanup failed");
+    })();
+    return resources.stopPromise;
   }
 }

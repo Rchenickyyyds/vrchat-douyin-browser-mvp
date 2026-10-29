@@ -1,6 +1,8 @@
 {
   "port": 3000,
-  "slotCount": 16,
+  "slotCount": 1,
+  "sessionTtlSeconds": 3600,
+  "viewTtlSeconds": 600,
   "heartbeatTimeoutSeconds": 90,
   "heartbeatSweepSeconds": 10,
   "douyinUrl": "https://www.douyin.com/",

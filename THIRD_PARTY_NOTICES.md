@@ -1,6 +1,6 @@
 # 第三方组件与来源
 
-本仓库的源码快照包含浏览器/推流编排、HTTP API、UdonSharp 客户端脚本与配置。第三方代码、SDK、可执行文件、浏览器 Profile、视频、音频及 World 示例素材不随快照打包；安装过程会从上游获取必要运行时。
+本仓库包含浏览器/推流编排、HTTP API、UdonSharp 客户端脚本与配置。除下述有完整许可的 Playwright seccomp 配方外，不打包第三方源码、SDK、可执行文件、浏览器 Profile、视频、音频及 World 素材；安装过程从上游获取运行时。
 
 原创集成代码采用 [MIT License](LICENSE)。此文件是来源清单，不替代各上游许可证，也不将上游组件重新许可。
 
@@ -18,6 +18,8 @@
 
 ## 外部运行时与开发工具
 
+`server/chromium-seccomp.json` 源自 [Microsoft Playwright v1.62.1 seccomp_profile.json](https://github.com/microsoft/playwright/blob/v1.62.1/utils/docker/seccomp_profile.json)，完整 Apache-2.0 许可及上游 NOTICE 保留为 `server/chromium-seccomp.LICENSE`、`server/chromium-seccomp.NOTICE`。2026-10-28 修改一条 `chroot` 规则：移除仅在容器拥有 CAP_SYS_CHROOT 时允许的条件，使 cap_drop ALL 下 Chromium 在新建的非特权 user namespace 内完成 sandbox chroot；未赋予容器额外 capability，内核仍执行权限检查。原文件 SHA-256 为 `cc3e61cabda6bbc1e53e54d27ba4d55a9d3be829b6dd1a596f4a7b31b1cc7849`，修改后为 `7624e457bd1483c99ceabb7b45305478109b12787d2f0acb6610ee6b0ae60519`。该文件不适用本项目 MIT 重新许可。
+
 | 组件 | 项目中的作用与来源 | 分发情况 |
 | --- | --- | --- |
 | [Node.js](https://nodejs.org/) | JavaScript 运行时；Node.js 主体使用 [MIT 与第三方许可证](https://github.com/nodejs/node/blob/main/LICENSE)；Docker 配方使用 Node 22 | 由用户安装或拉取官方基础镜像，不内置可执行文件 |
@@ -26,6 +28,7 @@
 | [X.Org / Xvfb](https://www.x.org/) | 虚拟 X 显示 | 由系统包安装，保留系统包版权信息 |
 | [PulseAudio](https://www.freedesktop.org/wiki/Software/PulseAudio/) | 每个 Slot 的虚拟音频 sink | 由系统包安装，保留系统包版权信息 |
 | [Caddy](https://caddyserver.com/) | HTTP/HTTPS 反向代理；上游 [Apache-2.0](https://github.com/caddyserver/caddy/blob/master/LICENSE) | Compose 拉取官方 `caddy:2` 镜像；仓库仅有配置 |
+| [Squid](https://www.squid-cache.org/) | 限制浏览器 HTTP/HTTPS 出口，按 [上游许可](https://www.squid-cache.org/Support/FAQ/FAQ-2.html) 及实际 Debian 包版权处理 | 从 Debian 软件源安装；仓库仅包含自己的代理配置 |
 | [Unity](https://unity.com/) | 编辑 World 和运行客户端开发工具 | 用户按 Unity 条款自行安装，仓库不附编辑器或素材 |
 | [VRChat Creator Companion / Worlds SDK](https://vcc.docs.vrchat.com/) | 提供 UdonSharp、`VRCUrl`、AVPro 接口、Build & Test 及示例 | 用户从 VRChat 官方渠道安装；仓库不附 SDK、AVPro 插件或 SDK 示例素材 |
 

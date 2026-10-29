@@ -1,0 +1,16 @@
+{
+  "like": [
+    "[data-e2e=\"feed-active-video\"] [data-e2e=\"video-like\"]",
+    "[data-e2e=\"video-like\"]",
+    "button[aria-label*=\"点赞\"]",
+    "[role=\"button\"][aria-label*=\"点赞\"]"
+  ],
+  "favorite": [
+    "[data-e2e=\"feed-active-video\"] [data-e2e=\"video-favorite\"]",
+    "[data-e2e=\"video-favorite\"]",
+    "button[aria-label*=\"收藏\"]",
+    "[role=\"button\"][aria-label*=\"收藏\"]"
+  ],
+  "nextKeys": ["PageDown", "ArrowDown"],
+  "prevKeys": ["PageUp", "ArrowUp"]
+}

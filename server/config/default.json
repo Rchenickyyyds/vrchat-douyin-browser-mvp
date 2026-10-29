@@ -1,0 +1,21 @@
+{
+  "port": 3000,
+  "slotCount": 16,
+  "heartbeatTimeoutSeconds": 90,
+  "heartbeatSweepSeconds": 10,
+  "douyinUrl": "https://www.douyin.com/",
+  "dataRoot": "./data",
+  "display": {
+    "width": 1080,
+    "height": 1920,
+    "fps": 30
+  },
+  "stream": {
+    "outputWidth": 540,
+    "outputHeight": 960,
+    "videoBitrate": "3500k",
+    "audioBitrate": "128k",
+    "hlsSegmentSeconds": 2,
+    "encoder": "auto"
+  }
+}

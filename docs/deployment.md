@@ -1,108 +1,119 @@
-# 部署与隔离验证
+# 部署与验收
 
-本说明适用于 `0.1.0` 源码快照。目标是让安装者在自己的隔离环境重建服务。Docker 镜像构建、实际抖音控制、GPU 编码、VRChat 和 Quest 的完整链路尚未在本轮验证；HTTP 健康检查或单元测试通过不代表这些步骤已成功。
+推荐专用 Linux VM，Docker Engine >=28 + Compose。worker 会运行不可信网页，主机不要有其他私人工作负载、云实例权限或 Docker socket 挂载。不同信任域用不同 VM 或独立容器栈/数据/网络。默认单 Session，先验收再考虑提高容量。
 
-## 环境要求
-
-- Linux 主机，能安装 Xvfb、PulseAudio、FFmpeg 与 Playwright 所需系统库。Docker 配方以 Debian Bookworm + Node 22 为基础。
-- Node.js 满足 `server/package.json` 的 `>=20` 要求；推荐使用仍受支持且与所用 Playwright 兼容的版本。容器方案由 Dockerfile 获取 Node 22。
-- 首次安装需要访问 npm、Playwright 浏览器下载源、Debian 软件源及容器镜像源。
-- 默认抓取 1080×1920 / 30 fps、输出 540×960 HLS。16 是 Slot 上限，不是已验证的主机并发容量。先从一个 Guest Session 测试资源占用。
-
-使用专用低权限环境，不挂载宿主机 SSH、云凭据、个人浏览器资料或其他秘密。Chromium 的 `--no-sandbox` 使容器和主机隔离尤为重要。
-
-## Docker：默认本机访问
-
-从项目根目录进入 `server`：
+## 初始化与启动
 
 ```bash
 cd server
 cp .env.example .env
-docker compose config
-docker compose up -d --build
+docker compose config --quiet
+docker compose build
+docker compose --profile setup run --rm init-access
+docker compose up -d
 curl --fail http://localhost:8080/health
-docker compose logs --tail=100 app caddy
 ```
 
-默认值为：
+基础镜像及系统包未锁定 digest，首次构建需要公网安装源。JavaScript 用 lockfile 的确切版本。镜像不会复制本机 .env、secrets、Profile 或运行数据。init-access 在 `access` volume 创建随机密钥，0600，拒绝覆盖；应用将该 volume 只读挂载，不从环境变量接受明文操作员密钥。
+
+app 以 UID1000 非 root运行，根文件系统只读，capabilities全部移除，保留 no-new-privileges；临时目录、数据卷和共享内存为独立受限存储。Chromium sandbox 如果不能正常启动，请检查宿主 user namespace/seccomp/AppArmor支持。不要关闭系统防护、增加 SYS_ADMIN 或使用 no-sandbox 作为正式修复。
+
+## 读取操作员密钥
+
+仅在自己的终端，将配置导出到私有临时目录，再用自己的安全编辑器读取/复制 token：
+
+```bash
+umask 077
+mkdir -p private-access
+docker compose run --rm --no-deps --entrypoint cat app /app/access/access.json > private-access/access.json
+```
+
+`private-access` 在 server/.dockerignore 与项目 .gitignore 中排除；不要移动到公开目录。浏览器打开本机控制台，在 password 框粘贴 token。控制台不会写入 localStorage；断开或离开页面清除其内存引用。关闭控制台不会立即关闭会话，心跳停止后超时回收。操作员 token 可以操控自己所有会话，应与会话控制令牌、只读观看链接区分。
+
+需要持久 Profile 时，在第一次初始化前覆盖命令明确授权：
+
+```bash
+docker compose --profile setup run --rm init-access /app/access/access.json operator guest,user1,user2
+```
+
+已有配置的管理、增加相互信任的操作员或轮换密钥需先停止 app，私下编辑 access volume 的 JSON 并保持 UID1000/0600。每项格式为 id、随机43字符以上base64url token、profiles数组、maxSessions整数；id和token不得重复，maxSessions不得超过SLOT_COUNT。不要使用示例固定密钥。轮换后重启 app，旧会话不会从磁盘恢复。
+
+## 会话与观看验证
+
+在控制台连接后创建 Guest。确认有随机会话ID、可过期观看链接，HLS分片通常比创建完成晚数秒。先用自己支持HLS的播放器确认画面与音频，再把完整HTTPS观看URL粘到VRChat输入框。
+
+验收至少包括：
+
+1. 没有Bearer不能创建或控制；另一个owner/另一个会话的控制token不能操作此会话；未授权Profile被拒。
+2. 没有观看token、错误token或只凭旧Slot不能取playlist/segment。观看token不能调用控制API。
+3. 发放新观看链接后旧playlist和segment立即拒绝；关闭后旧控制与观看均拒绝，Slot重用仍不能访问新会话。
+4. 停止心跳90秒后访问拒绝，随后目录与子进程回收；Guest不保留，永久Profile只属于对应owner。
+5. ffprobe确认H.264/AAC，并实际解码变化的画面与非静音音轨。健康检查不替代此项；抖音可能因登录/验证码/DOM变化而单独失败。
+
+控制台选中会话每30秒发心跳。默认最长1小时；观看链接默认10分钟，需要重新发放并粘贴。不要在个人资料或登录二维码显示时分享。API协议见README；不要把带Bearer的curl命令或完整观看URL粘进公开工单。
+
+## 网络出口
+
+app只连worker网络：`internal:true` 且 `gateway_mode_ipv4:isolated`，没有公网默认路由及宿主bridge IPv4地址；app网络命名空间显式禁用IPv6。Caddy与Squid是双网侧车；app不能直接连公网，Chromium经Squid到公网80/443。Squid在连接目标前拒绝私网、回环、link-local、metadata、IPv6 ULA等地址，CONNECT仅443。出口端口不发布；不缓存或记录访问URL。
+
+Docker旧版本不支持该网络模式，不能删除选项假装保持同等隔离。不要开启host网络或把其他私人服务连进worker网。浏览器仍能访问本worker的本地服务，因此API始终要求凭据；文件、音频和内核边界仍以专用worker为信任域。Caddy默认不启用访问日志，并过滤运行时错误日志的整个request字段，避免502等错误记录观看路径或鉴权头；新增CDN/反向代理/日志采集也需做同等脱敏，不要开启记录凭据或debug请求正文。
+
+官方依据：[Docker isolated gateway](https://docs.docker.com/engine/network/port-publishing/)、[Docker28变更](https://docs.docker.com/engine/release-notes/28/)、[Squid访问控制](https://www.squid-cache.org/Doc/config/http_access/)、[Playwright Docker sandbox](https://playwright.dev/docs/docker)。
+
+## 远端 HTTPS
+
+准备自己的域名、DNS和有效证书。设置示例（替换为自己的真实域名）：
 
 ```dotenv
-DOMAIN=http://localhost:8080
-BIND_ADDRESS=127.0.0.1
-HOST=127.0.0.1
-H264_ENCODER=auto
+DOMAIN=browser.example.com
+PUBLIC_ORIGIN=https://browser.example.com
+BIND_ADDRESS=0.0.0.0
+SLOT_COUNT=1
+H264_ENCODER=libx264
 ```
 
-Compose 会读取 `.env`。`HOST` 在容器内部被覆盖为 `0.0.0.0`，让 Caddy 通过 Compose 网络访问 Node；Node 的 3000 端口没有直接发布到宿主机。Caddy 的宿主机端口默认绑定 `127.0.0.1`，本机 HTTP 测试走 8080。这些默认值不提供远端 VRChat 接入。
+确认 DOMAIN 与 PUBLIC_ORIGIN 对应同一站点，再执行 `docker compose config --quiet`、构建并启动。Caddy负责HTTPS，通常需要TCP80/443；HTTP3另用UDP443。主机/云防火墙只放需要的入口，公网禁止8080，Node3000与代理3128均不发布。PUBLIC_ORIGIN不能含路径、userinfo或非本机HTTP，避免Host头参与生成分享地址。
 
-`/health` 返回 `ok` 表示 API 可达。Session 创建时才会启动 Xvfb、音频、Chromium 和 FFmpeg，因此健康检查成功后仍需进行下方 Guest 测试。
+确认浏览器证书、Origin检查、未鉴权拒绝和观看撤销后再让远端客户端使用。公网TLS、DNS和真实PCVR/Quest仍需各部署验收，不是本仓库自动提供的外部服务。
 
-## 原生 Linux 启动
+## 数据、停止与故障恢复
 
-先安装 Node.js、FFmpeg、Xvfb、PulseAudio 以及提供 `pactl` 的工具包，再在 `server` 中执行：
-
-```bash
-npm ci
-npm run install-browser
-export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/douyin-pulse-runtime}"
-mkdir -p "$XDG_RUNTIME_DIR"
-chmod 700 "$XDG_RUNTIME_DIR"
-pulseaudio --daemonize=yes --exit-idle-time=-1
-HOST=127.0.0.1 H264_ENCODER=libx264 npm start
-```
-
-`npm run install-browser` 会安装 Chromium 并尝试安装系统依赖，可能需要系统包管理权限。原生 `npm start` **不自动读取 `.env`**；请像上面这样显式传入环境变量，或自行使用合适的服务管理器配置。默认端口为 3000，此方式检查 `http://127.0.0.1:3000/health`。
-
-## 单个 Guest Session 检查
-
-下面示例在 Docker 的本机地址操作 Guest。它会打开 `config/default.json` 指定的网站并产生视频数据，需完整运行时和网络。首次测试不要登录真实账号。
-
-```bash
-base=http://localhost:8080
-slot=$(curl --fail --silent --show-error "$base/api/session/create/guest")
-curl --fail "$base/stream/$slot/index.m3u8"
-curl --fail "$base/api/session/$slot/heartbeat"
-curl --fail "$base/api/session/$slot/next"
-curl --fail "$base/api/session/$slot/close"
-```
-
-创建返回 Slot 不代表画面已有可播放分片；如收到 `stream not ready`，查看日志，等待分片生成后重试。可使用本机支持 HLS 的播放器检查音画。创建成功后每 90 秒内需发送 heartbeat，否则会被回收。`next` 请求成功仅说明按键已发送，实际网页是否翻页仍需看画面。
-
-关闭后检查 Guest 目录是否删除、该 Slot 是否可重用。User1/User2 的 API 结构相同，但会保留登录态；仅在隔离测试账号上验证重开后仍保持登录。Guest 目录不是安全擦除机制，备份和主机存储也需自行管理。
-
-## 显式启用远端 HTTPS 前
-
-当前 API 没有鉴权，HLS 没有访问控制。任何可达者均可选用持久 Profile 并发送控制请求。**不要只把绑定改为公网再登录个人账号。** 先补齐适合参与者的网络访问边界与服务端授权；公开 World 中的固定秘密不能证明用户身份。需要所有观看者可达 API/HLS 时，应先设计并验证相应授权代理，该功能尚未在此快照实现。
-
-在已确认访问范围、使用测试账号的受控环境中，远端 HTTPS 配置步骤为：
-
-1. 准备真实域名和 DNS，让目标客户端可解析到服务；证书申请方式与网络应满足所用 Caddy 的要求。
-2. 将 `.env` 的 `DOMAIN` 显式改为该域名，例如 `browser.example.com`。Caddy 会按其自动 HTTPS 规则处理；`http://localhost:8080` 仅供默认本机测试。
-3. 只将 `BIND_ADDRESS` 改为所需接口地址，并在主机防火墙/上游网络限制参与者。常规 HTTPS 涉及 TCP 443；Caddy 自动证书流程可能需要 TCP 80，HTTP/3 另涉及 UDP 443。确认 8080 不被无意公开。
-4. 重新 `docker compose config`，检查实际发布的端口和地址，再启动并核对证书与 `/health`。HTTPS 不等于鉴权。
-5. Unity 的 `BrowserSlotUrls.serverBaseUrl` 改为完全一致的 `https://` 地址，重新生成 URL，在真实客户端 Build & Test。Quest/Android 的 HTTPS 与媒体兼容性需单独实测。
-
-## 数据、停止与备份
-
-Compose 的 `app_data` volume 保存 Profile、Guest 目录和 HLS；`caddy_data` / `caddy_config` 保存 Caddy 状态。停止而保留 volume：
+`app_data`含owner哈希分层的永久Profile、Guest和HLS；`access`含操作员密钥，Caddy卷含证书/状态。备份前关闭Session，备份按秘密保护。旧 `/profiles/profile_user_1` 等目录不会自动分配给新owner，需明确确认权属并离线迁移，不能让新用户自动继承历史登录态。
 
 ```bash
 docker compose down
 ```
 
-不要在需要保留 Profile 时执行 `docker compose down -v`，它会删除项目管理的命名 volume。备份永久 Profile 前先关闭相关 Session，避免复制使用中的 Chromium 数据库。备份同样包含凭据，不得提交到仓库或附在公开问题中。
+上面保留卷。不要对需要保留的配置执行down -v或公开volume备份。正常退出会清理Session并删除 `.worker-lock`；crash或清理失败会保留锁，拒绝另一个worker共享数据。
 
-## 编码器与可复现边界
+遇到 stale lock：先 `docker compose down`，确认该专用栈的容器与浏览器/FFmpeg/Xvfb/Pulse进程已经退出，再在离线数据卷维护时删除 `.worker-lock`，随后启动。不要删除仍在运行实例的锁；不确定时停止整个专用VM并核对备份。清理失败后不能仅在API中释放Slot继续服务。
 
-先用 `H264_ENCODER=libx264` 验证 CPU 路径。NVIDIA 需要主机驱动、NVIDIA Container Toolkit 和适当 GPU 映射；Intel/AMD 通常需要配置 `/dev/dri` 及权限，FFmpeg 构建也必须支持对应编码器。`auto` 仅按可见编码器尝试，不保证容器内可用设备或流启动后的长期稳定性。
+## 可复现的离线媒体验收
 
-`npm ci` 使用锁定的 JavaScript 依赖。当前 Dockerfile 的 Node 标签、Compose 的 Caddy 标签和 apt 系统包未锁 digest/版本；不同日期构建可能得到不同运行时。需要严格重建相同二进制时，另行固定这些来源并保留实际包/镜像许可。此仓库当前提供可重复执行的安装配方，未声称逐字节构建一致。
-
-最小测试命令：
+镜像构建后可在独立、无网络、无数据卷的临时容器中运行受控动态画面与音频。该命令显式请求启动真实浏览器、显示、音频和编码器；使用约2CPU/2GiB，不要与繁忙会话争用资源：
 
 ```bash
-npm ci
-npm test
+docker run --rm --init --network none --read-only --cap-drop ALL \
+  --security-opt no-new-privileges --security-opt seccomp=./chromium-seccomp.json \
+  --tmpfs /tmp:rw,nosuid,nodev,noexec,size=512m,mode=1777 \
+  --tmpfs /home/node:rw,nosuid,nodev,noexec,size=64m,uid=1000,gid=1000,mode=700 \
+  --shm-size 512m --memory 2g --cpus 2 --pids-limit 512 \
+  --entrypoint node vrchat-douyin-browser:local scripts/verify-runtime.mjs --run
 ```
 
-现有测试不会启动真实网站、虚拟显示、音频或硬件编码器。完成上述步骤后，仍需按 README 的 Unity 接线执行真实 VRChat、late join 与 Quest 验证。
+输出仅检查结果、编码/解码统计，不打印密钥或观看链接。成功需要权限检查、Chromium sandbox、变化的视频帧、非静音AAC音轨、HTTP HLS取回、观看轮换及关闭撤销和目录清理全部通过；默认不会作为npm单测自动运行。可选 `--output-dir` 仅接受自己的私有目录，生成独立子目录存报告/抽帧；不要把真实站点或个人画面放进公开报告。
+
+该受控网页测试不证明抖音登录、当前selector或VRChat/Quest播放；这些仍需各自验收。
+
+## 原生 Linux 开发
+
+仅用于专用隔离开发环境；没有Compose的网络出口边界，不作为公网部署配方。安装Node>=20、Playwright Chromium及依赖、Xvfb/PulseAudio/pactl/FFmpeg，然后：
+
+```bash
+npm ci --ignore-scripts
+npm run install-browser
+node scripts/create-access.mjs secrets/access.json operator guest
+ACCESS_FILE="$PWD/secrets/access.json" PUBLIC_ORIGIN=http://localhost:3000 HOST=127.0.0.1 H264_ENCODER=libx264 npm start
+```
+
+不用共享PulseAudio daemon；每会话启动自己的私有实例。原生npm不自动读.env。root运行与缺少sandbox能力均不应作为部署捷径。单测用 `npm test`；真实VRChat接线与待验收项见 [Unity迁移](unity-migration.md)。
